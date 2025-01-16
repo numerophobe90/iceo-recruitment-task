@@ -1,7 +1,7 @@
 package com.example.stream
 
 import cats.data.EitherT
-import cats.effect.{Ref, Resource}
+import cats.effect.{IO, Ref, Resource}
 import cats.effect.kernel.Async
 import cats.effect.std.Queue
 import fs2.Stream
@@ -28,6 +28,16 @@ final class TransactionStream[F[_]](
       .evalMap(processUpdate)
   }
 
+  def drainOrdersQueue: F[Unit] = {
+    Stream
+      .eval(orders.tryTake)
+      .repeat
+      .unNoneTerminate
+      .evalMap(processUpdate)
+      .compile
+      .drain
+  }
+
   // Application should shut down on error,
   // If performLongRunningOperation fails, we don't want to insert/update the records
   // Transactions always have positive amount
@@ -45,7 +55,7 @@ final class TransactionStream[F[_]](
               // insert the transaction
               queries.insertTransaction.execute(transaction)
 
-          Async[F].uncancelable(poll =>
+          Async[F].uncancelable(_ =>
             performLongRunningOperation(
               transaction
             ).value.void
@@ -94,22 +104,30 @@ final class TransactionStream[F[_]](
 
 object TransactionStream {
 
+  private def gracefulShutdown[F[_]: Async: Logger](transactionStream: TransactionStream[F]) = Resource.onFinalize[F](
+    Logger[F].info(s"Trying to drain orders queue on completion") *> transactionStream.drainOrdersQueue
+  )
+
   def apply[F[_]: Async: Logger](
     operationTimer: FiniteDuration,
     session: Resource[F, Session[F]]
   ): Resource[F, TransactionStream[F]] = {
-    Resource.eval {
-      for {
-        counter      <- Ref.of(0)
-        queue        <- Queue.unbounded[F, OrderRow]
-        stateManager <- StateManager.apply
-      } yield new TransactionStream[F](
-        operationTimer,
-        queue,
-        session,
-        counter,
-        stateManager
-      )
-    }
+    val components = for {
+      counter      <- Ref.of(0)
+      queue        <- Queue.unbounded[F, OrderRow]
+      stateManager <- StateManager.apply
+    } yield (counter, queue, stateManager)
+
+    for {
+      (counter, queue, stateManager) <- Resource.eval(components)
+      transactionStream = new TransactionStream[F](
+                            operationTimer,
+                            queue,
+                            session,
+                            counter,
+                            stateManager
+                          )
+      _ <- gracefulShutdown(transactionStream)
+    } yield transactionStream
   }
 }
