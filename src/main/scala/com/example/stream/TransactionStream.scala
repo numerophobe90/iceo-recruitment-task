@@ -39,13 +39,19 @@ final class TransactionStream[F[_]](
           // parameters for order update
           val params = updatedOrder.filled *: state.orderId *: EmptyTuple
 
-          // update order with params
-          queries.updateOrder.execute(params) *>
-            // insert the transaction
-            queries.insertTransaction.execute(transaction) *>
-            performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
-              logger.error(th)(s"Got error when performing long running IO!")
-            )
+          val tx =
+            // update order with params
+            queries.updateOrder.execute(params) *>
+              // insert the transaction
+              queries.insertTransaction.execute(transaction)
+
+          performLongRunningOperation(
+            transaction
+          ).value.void
+            .redeemWith(th => logger.error(th)(s"Got error when performing long running IO!"), _ => tx.void)
+          // CAUTION: as we are currently executing a database transaction after a successful
+          // performLongRunningOperation, there can be a situation when performLongRunningOperation succeeds but
+          // database transaction don't
         }
         for {
           // Get current known order state
