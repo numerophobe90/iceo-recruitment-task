@@ -45,6 +45,24 @@ class TransactionRowTest extends AnyWordSpec with Matchers {
 
         transaction shouldBe empty
       }
+
+      "not be created if order is already fulfilled" in {
+        val ts = Instant.now
+        val order = OrderRow(
+          orderId = "example_id",
+          market = "btc_eur",
+          total = 0.8,
+          filled = 0.8,
+          createdAt = ts,
+          updatedAt = ts
+        )
+
+        val update = order.copy(filled = 0.5)
+
+        val transaction = TransactionRow.fromOrderUpdate(order, update)
+
+        transaction shouldBe empty
+      }
     }
   }
 }

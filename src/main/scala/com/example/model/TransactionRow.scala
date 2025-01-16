@@ -13,12 +13,13 @@ case class TransactionRow(
 object TransactionRow {
 
   // applying an order update may not result in transaction
-  def fromOrderUpdate(state: OrderRow, updated: OrderRow): Option[TransactionRow] = Option.when(updated.filled > 0) {
-    TransactionRow(
-      id = UUID.randomUUID(), // generate some id for our transaction
-      orderId = state.orderId,
-      amount = updated.filled - state.filled,
-      createdAt = Instant.now()
-    )
-  }
+  def fromOrderUpdate(state: OrderRow, updated: OrderRow): Option[TransactionRow] =
+    Option.when(updated.filled > 0 && !state.fulfilled) {
+      TransactionRow(
+        id = UUID.randomUUID(), // generate some id for our transaction
+        orderId = state.orderId,
+        amount = updated.filled - state.filled,
+        createdAt = Instant.now()
+      )
+    }
 }
