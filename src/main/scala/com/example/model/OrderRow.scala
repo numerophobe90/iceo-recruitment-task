@@ -10,5 +10,5 @@ case class OrderRow(
   createdAt: Instant,
   updatedAt: Instant
 ) {
-  def fulfilled: Boolean = total == filled //TODO: doesn't handle order "overflow"
+  def fulfilled: Boolean = total == filled // TODO: doesn't handle order "overflow"
 }

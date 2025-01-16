@@ -11,7 +11,8 @@ class PerKeySynchronizer[F[_]: Async](cell: AtomicCell[F, Map[String, Mutex[F]]]
       map
         .get(key) match {
         case Some(mutex) => Applicative[F].pure(map -> mutex)
-        case None        => Mutex[F].map(mutex => map.updated(key, mutex) -> mutex) //memleak, mutexes are not removed from the map
+        case None =>
+          Mutex[F].map(mutex => map.updated(key, mutex) -> mutex) // memleak, mutexes are not removed from the map
       }
     )
     for {
