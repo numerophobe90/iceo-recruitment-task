@@ -4,7 +4,7 @@ import cats.Applicative
 import cats.data.{EitherT, OptionT}
 import cats.effect.{IO, Ref, Resource}
 import cats.effect.kernel.Async
-import cats.effect.std.Queue
+import cats.effect.std.{AtomicCell, MapRef, Mutex, Queue}
 import fs2.Stream
 import org.typelevel.log4cats.Logger
 import cats.syntax.all._
@@ -17,17 +17,19 @@ import scala.concurrent.duration.FiniteDuration
 
 // All SQL queries inside the Queries object are correct and should not be changed
 final class TransactionStream[F[_]](
+  cell: AtomicCell[F, Map[String, Mutex[F]]],
   operationTimer: FiniteDuration,
   orders: Queue[F, OrderRow],
   session: Resource[F, Session[F]],
   transactionCounter: Ref[F, Int], // updated if long IO succeeds
-  stateManager: StateManager[F]    // utility for state management
+  stateManager: StateManager[F],   // utility for state management
+  maxConcurrent: Int
 )(implicit F: Async[F], logger: Logger[F]) {
 
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
-      .evalMap(processUpdate)
+      .parEvalMap(maxConcurrent)(processUpdateWithSynchronisation)
   }
 
   def drainOrdersQueue: F[Unit] = {
@@ -35,9 +37,26 @@ final class TransactionStream[F[_]](
       .eval(orders.tryTake)
       .repeat
       .unNoneTerminate
-      .evalMap(processUpdate)
+      .parEvalMap(maxConcurrent)(processUpdateWithSynchronisation)
       .compile
       .drain
+  }
+
+  private def processUpdateWithSynchronisation(updatedOrder: OrderRow) =
+    synchronizedWithinOrderId(updatedOrder.orderId, processUpdate(updatedOrder))
+
+  private def synchronizedWithinOrderId(orderId: String, eff: F[Unit]) = {
+    val acquireCorrespondingMutex = cell.evalModify(map =>
+      map
+        .get(orderId) match {
+        case Some(mutex) => F.pure(map -> mutex)
+        case None        => Mutex[F].map(mutex => map.updated(orderId, mutex) -> mutex)
+      }
+    )
+    for {
+      mutex <- acquireCorrespondingMutex
+      _     <- mutex.lock.surround(eff)
+    } yield ()
   }
 
   // Application should shut down on error,
@@ -121,22 +140,26 @@ object TransactionStream {
 
   def apply[F[_]: Async: Logger](
     operationTimer: FiniteDuration,
-    session: Resource[F, Session[F]]
+    session: Resource[F, Session[F]],
+    maxConcurrent: Int
   ): Resource[F, TransactionStream[F]] = {
     val components = for {
       counter      <- Ref.of(0)
       queue        <- Queue.unbounded[F, OrderRow]
       stateManager <- StateManager.apply
-    } yield (counter, queue, stateManager)
+      atomicCell   <- AtomicCell[F].of(Map.empty[String, Mutex[F]])
+    } yield (counter, queue, stateManager, atomicCell)
 
     for {
-      (counter, queue, stateManager) <- Resource.eval(components)
+      (counter, queue, stateManager, atomicCell) <- Resource.eval(components)
       transactionStream = new TransactionStream[F](
+                            atomicCell,
                             operationTimer,
                             queue,
                             session,
                             counter,
-                            stateManager
+                            stateManager,
+                            maxConcurrent
                           )
       _ <- gracefulShutdown(transactionStream)
     } yield transactionStream

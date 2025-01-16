@@ -415,6 +415,42 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
           txn.map(_.amount).sum shouldBe 0.8
         }
       }
+
+      "T11: updates of different orders should all be processed concurrently" in { fxt =>
+        val ts = Instant.now
+        val orders = (1 to 10)
+          .map(n =>
+            OrderRow(
+              orderId = s"example_id_$n",
+              market = "btc_eur",
+              total = 0.8,
+              filled = 0,
+              createdAt = ts,
+              updatedAt = ts
+            )
+          )
+          .toList
+
+        val updates = orders.map(_.copy(filled = 0.8))
+
+        val test = getResources(fxt, 100.millis, maxConcurrent = 10).use {
+          case Resources(stream, getO, getT, insertO, _) =>
+            for {
+              _ <- orders.traverse(stream.addNewOrder(_, insertO))
+              // start the stream
+              streamFiber <- stream.stream.compile.drain.start
+              // publish all updates
+              _       <- updates.traverse(stream.publish)
+              _       <- IO.sleep(150.millis)
+              _       <- streamFiber.cancel
+              results <- getResults(stream, getO, getT)
+            } yield results
+        }
+        test.map { case Result(counter, orders, transactions) =>
+          counter shouldBe 10
+        }
+      }
+
     }
   }
 
@@ -422,7 +458,8 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
   def getResources(
     fxt: FixtureParam,
     timer: FiniteDuration,
-    withTruncate: Boolean = true
+    withTruncate: Boolean = true,
+    maxConcurrent: Int = 16
   ): Resource[IO, Resources] = {
     for {
       _                 <- Resource.eval(IO.whenA(withTruncate)(truncateAllTables(fxt.databasePool)))
@@ -430,7 +467,7 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
       selectTransaction <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.getAllTransactions))
       insertOrder       <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.insertOrder))
       insertTransaction <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.insertTransaction))
-      stream            <- TransactionStream.apply(timer, fxt.databasePool.sessionResource)
+      stream            <- TransactionStream.apply(timer, fxt.databasePool.sessionResource, maxConcurrent)
     } yield Resources(stream, selectOrder, selectTransaction, insertOrder, insertTransaction)
   }
 
