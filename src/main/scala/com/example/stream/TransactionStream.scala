@@ -1,6 +1,7 @@
 package com.example.stream
 
-import cats.data.EitherT
+import cats.Applicative
+import cats.data.{EitherT, OptionT}
 import cats.effect.{IO, Ref, Resource}
 import cats.effect.kernel.Async
 import cats.effect.std.Queue
@@ -11,6 +12,7 @@ import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
 import skunk._
 
+import java.time.Instant
 import scala.concurrent.duration.FiniteDuration
 
 // All SQL queries inside the Queries object are correct and should not be changed
@@ -45,6 +47,10 @@ final class TransactionStream[F[_]](
   private def processUpdate(updatedOrder: OrderRow): F[Unit] = {
     PreparedQueries(session)
       .use { queries =>
+        def considerReEnqueueingUpdatedOrder =
+          Applicative[F].unlessA(updatedOrder.createdAt.isBefore(Instant.now.minusSeconds(5)))(
+            orders.offer(updatedOrder)
+          )
         def processTransaction(state: OrderRow, transaction: TransactionRow) = {
           // parameters for order update
           val params = updatedOrder.filled *: state.orderId *: EmptyTuple
@@ -67,11 +73,16 @@ final class TransactionStream[F[_]](
         }
         for {
           // Get current known order state
-          state <- stateManager.getOrderState(updatedOrder, queries)
-          transaction = TransactionRow.fromOrderUpdate(state = state, updated = updatedOrder)
-          _ <- transaction.fold(logger.info(s"Processing an update did not result in transaction."))(
-                 processTransaction(state, _)
-               )
+          maybeState <- OptionT(stateManager.getOrderState(updatedOrder, queries))
+                          .flatTapNone(considerReEnqueueingUpdatedOrder)
+                          .value
+          transaction =
+            maybeState.flatMap(state => TransactionRow.fromOrderUpdate(state = state, updated = updatedOrder))
+          _ <- maybeState.zip(transaction).fold(logger.info(s"Processing an update did not result in transaction.")) {
+                 case (state, transaction) =>
+                   processTransaction(state, transaction)
+               }
+
         } yield ()
       }
   }
