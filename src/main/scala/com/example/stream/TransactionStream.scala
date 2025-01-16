@@ -10,6 +10,7 @@ import org.typelevel.log4cats.Logger
 import cats.syntax.all._
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
+import com.example.synchronization.PerKeySynchronizer
 import skunk._
 
 import java.time.Instant
@@ -17,7 +18,7 @@ import scala.concurrent.duration.FiniteDuration
 
 // All SQL queries inside the Queries object are correct and should not be changed
 final class TransactionStream[F[_]](
-  cell: AtomicCell[F, Map[String, Mutex[F]]],
+  synchronizer: PerKeySynchronizer[F],
   operationTimer: FiniteDuration,
   orders: Queue[F, OrderRow],
   session: Resource[F, Session[F]],
@@ -43,21 +44,7 @@ final class TransactionStream[F[_]](
   }
 
   private def processUpdateWithSynchronisation(updatedOrder: OrderRow) =
-    synchronizedWithinOrderId(updatedOrder.orderId, processUpdate(updatedOrder))
-
-  private def synchronizedWithinOrderId(orderId: String, eff: F[Unit]) = {
-    val acquireCorrespondingMutex = cell.evalModify(map =>
-      map
-        .get(orderId) match {
-        case Some(mutex) => F.pure(map -> mutex)
-        case None        => Mutex[F].map(mutex => map.updated(orderId, mutex) -> mutex)
-      }
-    )
-    for {
-      mutex <- acquireCorrespondingMutex
-      _     <- mutex.lock.surround(eff)
-    } yield ()
-  }
+    synchronizer.synchronize(updatedOrder.orderId, processUpdate(updatedOrder))
 
   // Application should shut down on error,
   // If performLongRunningOperation fails, we don't want to insert/update the records
@@ -147,13 +134,13 @@ object TransactionStream {
       counter      <- Ref.of(0)
       queue        <- Queue.unbounded[F, OrderRow]
       stateManager <- StateManager.apply
-      atomicCell   <- AtomicCell[F].of(Map.empty[String, Mutex[F]])
-    } yield (counter, queue, stateManager, atomicCell)
+      synchronizer <- PerKeySynchronizer.instance[F]
+    } yield (counter, queue, stateManager, synchronizer)
 
     for {
-      (counter, queue, stateManager, atomicCell) <- Resource.eval(components)
+      (counter, queue, stateManager, synchronizer) <- Resource.eval(components)
       transactionStream = new TransactionStream[F](
-                            atomicCell,
+                            synchronizer,
                             operationTimer,
                             queue,
                             session,
