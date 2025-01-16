@@ -35,20 +35,25 @@ final class TransactionStream[F[_]](
   private def processUpdate(updatedOrder: OrderRow): F[Unit] = {
     PreparedQueries(session)
       .use { queries =>
+        def processTransaction(state: OrderRow, transaction: TransactionRow) = {
+          // parameters for order update
+          val params = updatedOrder.filled *: state.orderId *: EmptyTuple
+
+          // update order with params
+          queries.updateOrder.execute(params) *>
+            // insert the transaction
+            queries.insertTransaction.execute(transaction) *>
+            performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
+              logger.error(th)(s"Got error when performing long running IO!")
+            )
+        }
         for {
           // Get current known order state
           state <- stateManager.getOrderState(updatedOrder, queries)
           transaction = TransactionRow.fromOrderUpdate(state = state, updated = updatedOrder)
-          // parameters for order update
-          params = updatedOrder.filled *: state.orderId *: EmptyTuple
-          // update order with params
-          _ <- queries.updateOrder.execute(params)
-          // insert the transaction
-          _ <- queries.insertTransaction.execute(transaction)
-          _ <- performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
-                 logger.error(th)(s"Got error when performing long running IO!")
+          _ <- transaction.fold(logger.info(s"Processing an update did not result in transaction."))(
+                 processTransaction(state, _)
                )
-          _ <- logger.info(s"Successfully executed update!")
         } yield ()
       }
   }

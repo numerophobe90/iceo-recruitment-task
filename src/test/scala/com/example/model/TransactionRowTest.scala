@@ -24,7 +24,26 @@ class TransactionRowTest extends AnyWordSpec with Matchers {
 
         val transaction = TransactionRow.fromOrderUpdate(order, update)
 
-        transaction.amount shouldBe 0.5
+        transaction shouldBe defined
+        transaction.get.amount shouldBe 0.5
+      }
+
+      "not be created if update is empty" in {
+        val ts = Instant.now
+        val order = OrderRow(
+          orderId = "example_id",
+          market = "btc_eur",
+          total = 0.8,
+          filled = 0,
+          createdAt = ts,
+          updatedAt = ts
+        )
+
+        val update = order
+
+        val transaction = TransactionRow.fromOrderUpdate(order, update)
+
+        transaction shouldBe empty
       }
     }
   }
