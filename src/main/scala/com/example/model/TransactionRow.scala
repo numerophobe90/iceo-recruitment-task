@@ -12,11 +12,11 @@ case class TransactionRow(
 
 object TransactionRow {
 
-  def apply(state: OrderRow, updated: OrderRow): TransactionRow = {
+  def fromOrderUpdate(state: OrderRow, updated: OrderRow): TransactionRow = {
     TransactionRow(
       id = UUID.randomUUID(), // generate some id for our transaction
       orderId = state.orderId,
-      amount = state.filled,
+      amount = updated.filled - state.filled,
       createdAt = Instant.now()
     )
   }

@@ -6,7 +6,7 @@ case class OrderRow(
   orderId: String,
   market: String,
   total: BigDecimal,
-  filled: BigDecimal, //state of completion of the order
+  filled: BigDecimal, // state of completion of the order
   createdAt: Instant,
   updatedAt: Instant
 )

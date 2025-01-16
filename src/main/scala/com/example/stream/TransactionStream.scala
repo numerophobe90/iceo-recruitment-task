@@ -38,9 +38,9 @@ final class TransactionStream[F[_]](
         for {
           // Get current known order state
           state <- stateManager.getOrderState(updatedOrder, queries)
-          transaction = TransactionRow(state = state, updated = updatedOrder)
+          transaction = TransactionRow.fromOrderUpdate(state = state, updated = updatedOrder)
           // parameters for order update
-          params = state.filled *: state.orderId *: EmptyTuple
+          params = updatedOrder.filled *: state.orderId *: EmptyTuple
           // update order with params
           _ <- queries.updateOrder.execute(params)
           // insert the transaction
@@ -48,6 +48,7 @@ final class TransactionStream[F[_]](
           _ <- performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
                  logger.error(th)(s"Got error when performing long running IO!")
                )
+          _ <- logger.info(s"Successfully executed update!")
         } yield ()
       }
   }
