@@ -23,7 +23,6 @@ final class TransactionStream[F[_]](
   session: Resource[F, Session[F]],
   transactionCounter: Ref[F, Int], // updated if long IO succeeds
   stateManager: StateManager[F],   // utility for state management
-  maxConcurrent: Int,
   partitioner: Partitioner[F, OrderRow]
 )(implicit F: Async[F], logger: Logger[F]) {
 
