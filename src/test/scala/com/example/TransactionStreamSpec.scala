@@ -4,7 +4,8 @@ import cats.effect.{IO, Resource}
 import cats.implicits.toTraverseOps
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.Queries
-import com.example.stream.TransactionStream
+import com.example.stream.DefaultPartitioner.PartitionKeyHashFn
+import com.example.stream.{DefaultPartitioner, TransactionStream}
 import org.scalatest.OptionValues
 import org.scalatest.wordspec.FixtureAsyncWordSpec
 import skunk._
@@ -418,7 +419,7 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
 
       "T11: updates of different orders should all be processed concurrently" in { fxt =>
         val ts = Instant.now
-        val orders = (1 to 10)
+        val orders = (0 to 9)
           .map(n =>
             OrderRow(
               orderId = s"example_id_$n",
@@ -431,9 +432,13 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
           )
           .toList
 
+        val testPartitionerHashFn: PartitionKeyHashFn =
+          _.last.toInt // as each order id created in this test ends with digit from 0 to 9,
+        // using this hash fn will ensure each order update will end up on different partitions
+
         val updates = orders.map(_.copy(filled = 0.8))
 
-        val test = getResources(fxt, 100.millis, maxConcurrent = 10).use {
+        val test = getResources(fxt, 100.millis, maxConcurrent = 10, partitionerHashFn = testPartitionerHashFn).use {
           case Resources(stream, getO, getT, insertO, _) =>
             for {
               _ <- orders.traverse(stream.addNewOrder(_, insertO))
@@ -459,7 +464,8 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
     fxt: FixtureParam,
     timer: FiniteDuration,
     withTruncate: Boolean = true,
-    maxConcurrent: Int = 16
+    maxConcurrent: Int = 16,
+    partitionerHashFn: PartitionKeyHashFn = DefaultPartitioner.defaultHashFn
   ): Resource[IO, Resources] = {
     for {
       _                 <- Resource.eval(IO.whenA(withTruncate)(truncateAllTables(fxt.databasePool)))

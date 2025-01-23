@@ -1,6 +1,6 @@
 package com.example.stream
 
-import cats.Applicative
+import cats.{Applicative, Functor}
 import cats.data.{EitherT, OptionT}
 import cats.effect.{IO, Ref, Resource}
 import cats.effect.kernel.Async
@@ -8,9 +8,9 @@ import cats.effect.std.{AtomicCell, MapRef, Mutex, Queue}
 import fs2.Stream
 import org.typelevel.log4cats.Logger
 import cats.syntax.all._
+import com.example.model.OrderRow.orderRowHasPartitonKey
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
-import com.example.synchronization.PerKeySynchronizer
 import skunk._
 
 import java.time.Instant
@@ -18,19 +18,23 @@ import scala.concurrent.duration.FiniteDuration
 
 // All SQL queries inside the Queries object are correct and should not be changed
 final class TransactionStream[F[_]](
-  synchronizer: PerKeySynchronizer[F],
   operationTimer: FiniteDuration,
   orders: Queue[F, OrderRow],
   session: Resource[F, Session[F]],
   transactionCounter: Ref[F, Int], // updated if long IO succeeds
   stateManager: StateManager[F],   // utility for state management
-  maxConcurrent: Int
+  maxConcurrent: Int,
+  partitioner: Partitioner[F, OrderRow]
 )(implicit F: Async[F], logger: Logger[F]) {
+
+  private val processPartitions =
+    partitioner.partitionsStream.map(partition => partition.evalMap(processUpdate)).parJoinUnbounded
 
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
-      .parEvalMap(maxConcurrent)(processUpdateWithSynchronisation)
+      .evalMap(partitioner.offerToPartition)
+      .mergeHaltBoth(processPartitions)
   }
 
   def drainOrdersQueue: F[Unit] = {
@@ -38,13 +42,10 @@ final class TransactionStream[F[_]](
       .eval(orders.tryTake)
       .repeat
       .unNoneTerminate
-      .parEvalMap(maxConcurrent)(processUpdateWithSynchronisation)
+      .evalMap(processUpdate) // TODO: could be partitioned using partitioner like the main stream is
       .compile
       .drain
   }
-
-  private def processUpdateWithSynchronisation(updatedOrder: OrderRow) =
-    synchronizer.synchronize(updatedOrder.orderId, processUpdate(updatedOrder))
 
   // Application should shut down on error,
   // If performLongRunningOperation fails, we don't want to insert/update the records
@@ -134,19 +135,19 @@ object TransactionStream {
       counter      <- Ref.of(0)
       queue        <- Queue.unbounded[F, OrderRow]
       stateManager <- StateManager.apply
-      synchronizer <- PerKeySynchronizer.instance[F]
-    } yield (counter, queue, stateManager, synchronizer)
+      partitioner  <- DefaultPartitioner.make[F, OrderRow](maxConcurrent)
+    } yield (counter, queue, stateManager, partitioner)
 
     for {
-      (counter, queue, stateManager, synchronizer) <- Resource.eval(components)
+      (counter, queue, stateManager, partitioner) <- Resource.eval(components)
       transactionStream = new TransactionStream[F](
-                            synchronizer,
                             operationTimer,
                             queue,
                             session,
                             counter,
                             stateManager,
-                            maxConcurrent
+                            maxConcurrent,
+                            partitioner
                           )
       _ <- gracefulShutdown(transactionStream)
     } yield transactionStream

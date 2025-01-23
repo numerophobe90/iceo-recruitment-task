@@ -1,5 +1,7 @@
 package com.example.model
 
+import com.example.stream.HasPartitionKey
+
 import java.time.Instant
 
 case class OrderRow(
@@ -11,4 +13,8 @@ case class OrderRow(
   updatedAt: Instant
 ) {
   def fulfilled: Boolean = total == filled // TODO: doesn't handle order "overflow"
+}
+
+object OrderRow {
+  implicit val orderRowHasPartitonKey: HasPartitionKey[OrderRow] = (t: OrderRow) => t.orderId
 }
