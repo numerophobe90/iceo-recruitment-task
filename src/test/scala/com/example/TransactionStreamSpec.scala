@@ -4,7 +4,8 @@ import cats.effect.{IO, Resource}
 import cats.implicits.toTraverseOps
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.Queries
-import com.example.stream.TransactionStream
+import com.example.stream.DefaultPartitioner.PartitionKeyHashFn
+import com.example.stream.{DefaultPartitioner, TransactionStream}
 import org.scalatest.OptionValues
 import org.scalatest.wordspec.FixtureAsyncWordSpec
 import skunk._
@@ -415,6 +416,46 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
           txn.map(_.amount).sum shouldBe 0.8
         }
       }
+
+      "T11: updates of different orders should all be processed concurrently" in { fxt =>
+        val ts = Instant.now
+        val orders = (0 to 9)
+          .map(n =>
+            OrderRow(
+              orderId = s"example_id_$n",
+              market = "btc_eur",
+              total = 0.8,
+              filled = 0,
+              createdAt = ts,
+              updatedAt = ts
+            )
+          )
+          .toList
+
+        val testPartitionerHashFn: PartitionKeyHashFn =
+          _.last.toInt // as each order id created in this test ends with digit from 0 to 9,
+        // using this hash fn will ensure each order update will end up on different partitions
+
+        val updates = orders.map(_.copy(filled = 0.8))
+
+        val test = getResources(fxt, 100.millis, maxConcurrent = 10, partitionerHashFn = testPartitionerHashFn).use {
+          case Resources(stream, getO, getT, insertO, _) =>
+            for {
+              _ <- orders.traverse(stream.addNewOrder(_, insertO))
+              // start the stream
+              streamFiber <- stream.stream.compile.drain.start
+              // publish all updates
+              _       <- updates.traverse(stream.publish)
+              _       <- IO.sleep(150.millis)
+              _       <- streamFiber.cancel
+              results <- getResults(stream, getO, getT)
+            } yield results
+        }
+        test.map { case Result(counter, orders, transactions) =>
+          counter shouldBe 10
+        }
+      }
+
     }
   }
 
@@ -422,7 +463,9 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
   def getResources(
     fxt: FixtureParam,
     timer: FiniteDuration,
-    withTruncate: Boolean = true
+    withTruncate: Boolean = true,
+    maxConcurrent: Int = 16,
+    partitionerHashFn: PartitionKeyHashFn = DefaultPartitioner.defaultHashFn
   ): Resource[IO, Resources] = {
     for {
       _                 <- Resource.eval(IO.whenA(withTruncate)(truncateAllTables(fxt.databasePool)))
@@ -430,7 +473,7 @@ class TransactionStreamSpec extends FixtureAsyncWordSpec with BaseIOSpec with Op
       selectTransaction <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.getAllTransactions))
       insertOrder       <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.insertOrder))
       insertTransaction <- fxt.databasePool.sessionResource.evalMap(_.prepare(Queries.insertTransaction))
-      stream            <- TransactionStream.apply(timer, fxt.databasePool.sessionResource)
+      stream            <- TransactionStream.apply(timer, fxt.databasePool.sessionResource, maxConcurrent)
     } yield Resources(stream, selectOrder, selectTransaction, insertOrder, insertTransaction)
   }
 

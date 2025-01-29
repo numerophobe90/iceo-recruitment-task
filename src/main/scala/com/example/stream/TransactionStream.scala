@@ -1,16 +1,19 @@
 package com.example.stream
 
-import cats.data.EitherT
-import cats.effect.{Ref, Resource}
+import cats.{Applicative, Functor}
+import cats.data.{EitherT, OptionT}
+import cats.effect.{IO, Ref, Resource}
 import cats.effect.kernel.Async
-import cats.effect.std.Queue
+import cats.effect.std.{AtomicCell, MapRef, Mutex, Queue}
 import fs2.Stream
 import org.typelevel.log4cats.Logger
 import cats.syntax.all._
+import com.example.model.OrderRow.orderRowHasPartitonKey
 import com.example.model.{OrderRow, TransactionRow}
 import com.example.persistence.PreparedQueries
 import skunk._
 
+import java.time.Instant
 import scala.concurrent.duration.FiniteDuration
 
 // All SQL queries inside the Queries object are correct and should not be changed
@@ -19,13 +22,28 @@ final class TransactionStream[F[_]](
   orders: Queue[F, OrderRow],
   session: Resource[F, Session[F]],
   transactionCounter: Ref[F, Int], // updated if long IO succeeds
-  stateManager: StateManager[F]    // utility for state management
+  stateManager: StateManager[F],   // utility for state management
+  partitioner: Partitioner[F, OrderRow]
 )(implicit F: Async[F], logger: Logger[F]) {
+
+  private val processPartitions =
+    partitioner.partitionsStream.map(partition => partition.evalMap(processUpdate)).parJoinUnbounded
 
   def stream: Stream[F, Unit] = {
     Stream
       .fromQueueUnterminated(orders)
-      .evalMap(processUpdate)
+      .evalMap(partitioner.offerToPartition)
+      .mergeHaltBoth(processPartitions)
+  }
+
+  def drainOrdersQueue: F[Unit] = {
+    Stream
+      .eval(orders.tryTake)
+      .repeat
+      .unNoneTerminate
+      .evalMap(processUpdate) // TODO: could be partitioned using partitioner like the main stream is
+      .compile
+      .drain
   }
 
   // Application should shut down on error,
@@ -35,19 +53,42 @@ final class TransactionStream[F[_]](
   private def processUpdate(updatedOrder: OrderRow): F[Unit] = {
     PreparedQueries(session)
       .use { queries =>
+        def considerReEnqueueingUpdatedOrder =
+          Applicative[F].unlessA(updatedOrder.createdAt.isBefore(Instant.now.minusSeconds(5)))(
+            orders.offer(updatedOrder)
+          )
+        def processTransaction(state: OrderRow, transaction: TransactionRow) = {
+          // parameters for order update
+          val params = updatedOrder.filled *: state.orderId *: EmptyTuple
+
+          val tx =
+            // update order with params
+            queries.updateOrder.execute(params) *>
+              // insert the transaction
+              queries.insertTransaction.execute(transaction)
+
+          Async[F].uncancelable(_ =>
+            performLongRunningOperation(
+              transaction
+            ).value.void
+              .redeemWith(th => logger.error(th)(s"Got error when performing long running IO!"), _ => tx.void)
+          )
+          // CAUTION: as we are currently executing a database transaction after a successful
+          // performLongRunningOperation, there can be a situation when performLongRunningOperation succeeds but
+          // database transaction don't
+        }
         for {
           // Get current known order state
-          state <- stateManager.getOrderState(updatedOrder, queries)
-          transaction = TransactionRow(state = state, updated = updatedOrder)
-          // parameters for order update
-          params = state.filled *: state.orderId *: EmptyTuple
-          // update order with params
-          _ <- queries.updateOrder.execute(params)
-          // insert the transaction
-          _ <- queries.insertTransaction.execute(transaction)
-          _ <- performLongRunningOperation(transaction).value.void.handleErrorWith(th =>
-                 logger.error(th)(s"Got error when performing long running IO!")
-               )
+          maybeState <- OptionT(stateManager.getOrderState(updatedOrder, queries))
+                          .flatTapNone(considerReEnqueueingUpdatedOrder)
+                          .value
+          transaction =
+            maybeState.flatMap(state => TransactionRow.fromOrderUpdate(state = state, updated = updatedOrder))
+          _ <- maybeState.zip(transaction).fold(logger.info(s"Processing an update did not result in transaction.")) {
+                 case (state, transaction) =>
+                   processTransaction(state, transaction)
+               }
+
         } yield ()
       }
   }
@@ -80,22 +121,33 @@ final class TransactionStream[F[_]](
 
 object TransactionStream {
 
+  private def gracefulShutdown[F[_]: Async: Logger](transactionStream: TransactionStream[F]) = Resource.onFinalize[F](
+    Logger[F].info(s"Trying to drain orders queue on completion") *> transactionStream.drainOrdersQueue
+  )
+
   def apply[F[_]: Async: Logger](
     operationTimer: FiniteDuration,
-    session: Resource[F, Session[F]]
+    session: Resource[F, Session[F]],
+    maxConcurrent: Int
   ): Resource[F, TransactionStream[F]] = {
-    Resource.eval {
-      for {
-        counter      <- Ref.of(0)
-        queue        <- Queue.unbounded[F, OrderRow]
-        stateManager <- StateManager.apply
-      } yield new TransactionStream[F](
-        operationTimer,
-        queue,
-        session,
-        counter,
-        stateManager
-      )
-    }
+    val components = for {
+      counter      <- Ref.of(0)
+      queue        <- Queue.unbounded[F, OrderRow]
+      stateManager <- StateManager.apply
+      partitioner  <- DefaultPartitioner.make[F, OrderRow](maxConcurrent)
+    } yield (counter, queue, stateManager, partitioner)
+
+    for {
+      (counter, queue, stateManager, partitioner) <- Resource.eval(components)
+      transactionStream = new TransactionStream[F](
+                            operationTimer,
+                            queue,
+                            session,
+                            counter,
+                            stateManager,
+                            partitioner
+                          )
+      _ <- gracefulShutdown(transactionStream)
+    } yield transactionStream
   }
 }
