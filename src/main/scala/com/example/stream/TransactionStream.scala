@@ -145,7 +145,6 @@ object TransactionStream {
                             session,
                             counter,
                             stateManager,
-                            maxConcurrent,
                             partitioner
                           )
       _ <- gracefulShutdown(transactionStream)
